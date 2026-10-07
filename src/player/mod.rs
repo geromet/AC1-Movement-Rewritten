@@ -27,6 +27,9 @@ pub mod swing;
 pub mod targets;
 pub mod walling;
 
+#[cfg(test)]
+mod transition_tests;
+
 use bevy::prelude::*;
 
 use crate::tuning::*;
@@ -57,6 +60,34 @@ pub struct Locomotion {
     pub current: ActorContextId,
     pub previous: ActorContextId,
     pub just_switched: bool,
+    /// Per-actor update epoch, incremented once per actor update by `advance_player_tick`.
+    pub tick: u64,
+    /// The actor-update epoch on which the current context was switched in. The destination skips
+    /// exactly one actor update on the first tick after this one, independent of where the source and
+    /// destination sit in the chained schedule (REV-004).
+    pub switch_tick: u64,
+}
+
+/// Run condition for a locomotion context system (REV-004).
+///
+/// A context may run this actor update only when it is the active one and it was not switched in during
+/// this very update. The destination of a switch is therefore parked for the switch tick and activates
+/// on the next actor update, exactly one skipped update, no matter where the source and destination sit
+/// in the chained schedule. (Previously a destination that ran later in the chain consumed its
+/// `just_switched` skip in the switch frame, while one that had already run deferred it by a frame.)
+pub fn context_active(id: ActorContextId) -> impl Fn(Query<&Locomotion, With<Player>>) -> bool + Clone + Send + Sync + 'static {
+    move |q: Query<&Locomotion, With<Player>>| {
+        q.single()
+            .map(|loco| loco.current == id && !(loco.just_switched && loco.switch_tick == loco.tick))
+            .unwrap_or(false)
+    }
+}
+
+/// Advance every actor's update epoch (REV-004). Runs before the context systems.
+pub fn advance_player_tick(mut q: Query<&mut Locomotion, With<Player>>) {
+    for mut loco in &mut q {
+        loco.tick = loco.tick.wrapping_add(1);
+    }
 }
 
 /// Kinematic body: feet position, facing (yaw, radians; 0 = facing -Z) and velocity.
@@ -204,6 +235,7 @@ pub fn switch_context(loco: &mut Locomotion, data: &mut HumanDataBundle, setup: 
         }
     };
     loco.just_switched = true;
+    loco.switch_tick = loco.tick;
 }
 
 /// The skipped first update of a context just switched in (`AIActor::Update`, the `justSwitched` byte): the context's
@@ -234,7 +266,20 @@ impl Plugin for PlayerPlugin {
             .add_systems(Startup, spawn_player)
             .add_systems(
                 Update,
-                (ground::update_ground, air::update_air, ledge::update_ledge, climb::update_climb, hay::update_hay, walling::update_walling, narrow::update_narrow, ladder::update_ladder, release_limbs, proxy_layer, sync_visuals)
+                (
+                    advance_player_tick,
+                    ground::update_ground.run_if(context_active(ActorContextId::Ground)),
+                    air::update_air.run_if(context_active(ActorContextId::InAir)),
+                    ledge::update_ledge.run_if(context_active(ActorContextId::Ledge)),
+                    climb::update_climb.run_if(context_active(ActorContextId::Climb)),
+                    hay::update_hay.run_if(context_active(ActorContextId::HayStack)),
+                    walling::update_walling.run_if(context_active(ActorContextId::Walling)),
+                    narrow::update_narrow.run_if(context_active(ActorContextId::NarrowObject)),
+                    ladder::update_ladder.run_if(context_active(ActorContextId::Ladder)),
+                    release_limbs,
+                    proxy_layer,
+                    sync_visuals,
+                )
                     .chain()
                     .in_set(PlayerSet),
             );
@@ -281,7 +326,7 @@ struct HandMarker(usize);
 pub fn player_components(feet: Vec3, heading: f32) -> impl Bundle {
     (
         Player,
-        Locomotion { current: ActorContextId::Ground, previous: ActorContextId::Ground, just_switched: false },
+        Locomotion { current: ActorContextId::Ground, previous: ActorContextId::Ground, just_switched: false, tick: 0, switch_tick: 0 },
         Body { feet, heading, grounded: true, ..default() },
         HumanDataBundle::default(),
         LimbTargets::default(),

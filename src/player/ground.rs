@@ -79,6 +79,12 @@ pub struct HumanGroundData {
     /// Played when `oneshot` ends (the run stop's settle into the wait).
     pub oneshot_next: Option<ActionBlend>,
     pub last_landing: Option<Landing>,
+    /// The landing effect requested by the entry that is currently being activated: set on every
+    /// `TransitionSetupDataToMovement` application and consumed (taken) by the destination's first
+    /// update. It is deliberately separate from durable `last_landing` history so a non-landing entry
+    /// (pull-up / ladder / pass-over / ledge exit) cannot replay a prior fatal landing or shake
+    /// (REV-001).
+    pub pending_landing: Option<Landing>,
     /// Incremented on every landing (lets the animator play the landing clip once).
     pub landing_seq: u32,
     /// `HumanGround__UpdateMoveBlend` state: blend weights, timers, lean/bank, step cycle.
@@ -178,6 +184,9 @@ impl HumanGroundData {
         self.collide = None;
         self.look_down = None;
         self.oneshot_next = None;
+        // The activation's one-shot effect is exactly this entry's landing; `last_landing` below stays
+        // durable history (REV-001).
+        self.pending_landing = landing;
         if landing.is_none() {
             // PORT: entries without a landing (pull-up, beam / ladder / pass-over exits …) start standing. The game's
             // OnEnterInit 0xDA7D20 leaves HG+0x5E8 alone, but those contexts drive the parameter themselves; the port's
@@ -232,9 +241,10 @@ pub fn update_ground(
             continue;
         }
         if loco.just_switched {
-            // AIActor::Update skips a context's first update after it was switched in.
+            // AIActor::Update skips a context's first update after it was switched in. Only the landing
+            // requested by THIS entry is applied; durable `last_landing` stays history (REV-001).
             loco.just_switched = false;
-            if let Some(l) = g.last_landing {
+            if let Some(l) = g.pending_landing.take() {
                 // drop > 3 m: camera shake (drop − 3) / 7 (0xE05940)
                 if l.total_drop > 3.0 {
                     rig.shake = ((l.total_drop - 3.0) / 7.0).min(1.0);

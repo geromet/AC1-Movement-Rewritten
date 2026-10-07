@@ -36,7 +36,22 @@ impl Sim {
             .insert_resource(PadInput { legs_pressed_ago: f32::INFINITY, hand_pressed_ago: f32::INFINITY, ..default() })
             .insert_resource(SpawnPoint(SPAWN))
             .init_resource::<CameraRig>()
-            .add_systems(Update, (ground::update_ground, air::update_air, ledge::update_ledge, climb::update_climb, crate::player::hay::update_hay, crate::player::walling::update_walling, crate::player::narrow::update_narrow, crate::player::ladder::update_ladder, crate::player::release_limbs).chain());
+            .add_systems(
+                Update,
+                (
+                    crate::player::advance_player_tick,
+                    ground::update_ground.run_if(crate::player::context_active(ActorContextId::Ground)),
+                    air::update_air.run_if(crate::player::context_active(ActorContextId::InAir)),
+                    ledge::update_ledge.run_if(crate::player::context_active(ActorContextId::Ledge)),
+                    climb::update_climb.run_if(crate::player::context_active(ActorContextId::Climb)),
+                    crate::player::hay::update_hay.run_if(crate::player::context_active(ActorContextId::HayStack)),
+                    crate::player::walling::update_walling.run_if(crate::player::context_active(ActorContextId::Walling)),
+                    crate::player::narrow::update_narrow.run_if(crate::player::context_active(ActorContextId::NarrowObject)),
+                    crate::player::ladder::update_ladder.run_if(crate::player::context_active(ActorContextId::Ladder)),
+                    crate::player::release_limbs,
+                )
+                    .chain(),
+            );
         let (c, g) = level::geometry();
         app.insert_resource(c).insert_resource(g);
         let player = app.world_mut().spawn(player_components(feet, heading)).id();

@@ -155,7 +155,13 @@ pub struct HumanInAirData {
     /// Seconds since entering InAir (used to avoid re-catching the ledge just released).
     pub time_in_air: f32,
     /// Last catch (fall height ≥ 3 m selects the long catch animations in the game, 0xE0BB70).
+    /// Reset on every entry so a later unrelated InAir lifetime cannot reuse the previous catch
+    /// classification (REV-007).
     pub long_catch: bool,
+    /// The velocity an `InAirEntry::Fall` requested for the body. Applied on the destination's first
+    /// update before the controller integrates, so a stale `Body.velocity` from the previous context
+    /// cannot coast across the transition (REV-006).
+    pub entry_fall_velocity: Option<Vec3>,
     pub mode: AirMode,
     /// JumpApexPosition (+0xD0): where descent started — the fall-height reference.
     pub apex_y: f32,
@@ -198,6 +204,10 @@ impl HumanInAirData {
         self.fall_t = 0.0;
         self.flat_horizontal = false;
         self.drop = None;
+        // A catch classification belongs to one InAir lifetime; the current event re-classifies it at
+        // the catch (REV-007). A Fall's requested velocity is owned by this entry (REV-006).
+        self.long_catch = false;
+        self.entry_fall_velocity = None;
         match entry {
             InAirEntry::JumpToTarget { from, target, speed_param, foot_left } => {
                 self.speed_ratio = speed_param;
@@ -294,13 +304,15 @@ impl HumanInAirData {
                 }
                 self.flat_horizontal = true;
             }
-            InAirEntry::Fall { from, origin, speed_param, .. } => {
+            InAirEntry::Fall { from, origin, speed_param, velocity } => {
                 self.speed_ratio = speed_param;
                 self.start_y = from.y;
                 self.start = from;
                 self.apex_y = from.y;
                 self.prev_y = from.y;
                 self.fall_origin = origin;
+                // The entry's requested velocity is applied by the destination's first update (REV-006).
+                self.entry_fall_velocity = Some(velocity);
                 self.mode = AirMode::Fall { steer_to: None };
             }
         }
@@ -436,6 +448,11 @@ pub fn update_air(
         }
         if loco.just_switched {
             loco.just_switched = false;
+            // A Fall entry owns the body handoff: apply its requested velocity before the controller
+            // integrates so stale velocity cannot coast across the transition (REV-006).
+            if let Some(v) = data.air.entry_fall_velocity.take() {
+                body.velocity = v;
+            }
             // the controller keeps integrating the take-off velocity; the jump's path shifts with it so the
             // linear correction (0xE0DEF0) still ends on the target
             let before = body.feet;

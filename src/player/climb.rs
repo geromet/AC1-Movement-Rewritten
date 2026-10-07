@@ -405,6 +405,9 @@ impl HumanClimbData {
         self.ground_follow = None;
         self.reach = None;
         self.settle = None;
+        // Completion-only state is per Climb lifetime: an interrupted (lost-grip) to-ground move must
+        // not leak its continuation into a later, unrelated Climb entry (REV-005).
+        self.to_ground = false;
         self.set_frame();
     }
 
