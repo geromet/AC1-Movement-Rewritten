@@ -205,31 +205,19 @@ pub fn parse_skeleton(d: &[u8]) -> Vec<SkelBone> {
     let mut bones: Vec<SkelBone> = Vec::new();
     let mut parents: Vec<Option<u32>> = Vec::new();
     let mut i = 8;
+    // `i + 9` only proves the outer object header is present. Every deeper field (BoneID,
+    // parent tag and the 64 bytes of transforms) is validated by `read_bone`; a truncated
+    // marker is skipped deterministically instead of reaching a slice/`unwrap` panic.
     while i + 9 < d.len() {
         if d[i] == 0 && u32_at(d, i + 5) == Some(CLASS_BONE) {
-            let mut p = i + 9;
-            let object_id = u32_at(d, i + 1).unwrap();
-            let bone_id = u32_at(d, p).unwrap();
-            p += 4;
-            let parent = if d[p] == 2 {
-                p += 5;
-                u32_at(d, p - 4)
-            } else {
-                p += 1;
-                None
-            };
-            p += 9; // embedded transform object header
-            let f = |o: usize| f32_at(d, o);
-            let ga = [f(p), f(p + 4), f(p + 8)];
-            let gr = [f(p + 16), f(p + 20), f(p + 24), f(p + 28)];
-            let la = [f(p + 32), f(p + 36), f(p + 40)];
-            let lr = [f(p + 48), f(p + 52), f(p + 56), f(p + 60)];
-            bones.push(SkelBone { object_id, bone_id, parent: None, local_pos: la, local_rot: lr, global_pos: ga, global_rot: gr });
-            parents.push(parent);
-            i = p + 64;
-        } else {
-            i += 1;
+            if let Some((bone, parent, next)) = read_bone(d, i) {
+                bones.push(bone);
+                parents.push(parent);
+                i = next;
+                continue;
+            }
         }
+        i += 1;
     }
     for k in 0..bones.len() {
         if let Some(pid) = parents[k] {
@@ -237,6 +225,32 @@ pub fn parse_skeleton(d: &[u8]) -> Vec<SkelBone> {
         }
     }
     bones
+}
+
+/// Read one inline `Bone` record at `i`, returning `(bone, parent object id, next offset)`.
+/// Returns `None` when the record is truncated or malformed so the scanner can skip it.
+fn read_bone(d: &[u8], i: usize) -> Option<(SkelBone, Option<u32>, usize)> {
+    let object_id = u32_at(d, i + 1)?;
+    let mut p = i + 9;
+    let bone_id = u32_at(d, p)?;
+    p += 4;
+    let parent = if *d.get(p)? == 2 {
+        let pid = u32_at(d, p + 1)?;
+        p += 5;
+        Some(pid)
+    } else {
+        p += 1;
+        None
+    };
+    p += 9; // embedded transform object header
+    let end = p.checked_add(64)?;
+    d.get(p..end)?; // both transform quads must be inside the payload
+    let f = |o: usize| f32_at(d, o);
+    let ga = [f(p), f(p + 4), f(p + 8)];
+    let gr = [f(p + 16), f(p + 20), f(p + 24), f(p + 28)];
+    let la = [f(p + 32), f(p + 36), f(p + 40)];
+    let lr = [f(p + 48), f(p + 52), f(p + 56), f(p + 60)];
+    Some((SkelBone { object_id, bone_id, parent: None, local_pos: la, local_rot: lr, global_pos: ga, global_rot: gr }, parent, end))
 }
 
 /// Decoded texture: RGBA8 mip chain (largest first).
@@ -367,4 +381,32 @@ pub(super) fn decode_bc(src: &[u8], w: u32, h: u32, bc3: bool) -> Vec<u8> {
 /// Class hashes used when resolving materials (CRC32 of the class names).
 pub fn class_hash(name: &str) -> u32 {
     crc32(name)
+}
+
+#[cfg(test)]
+mod checked_decode_tests {
+    use super::*;
+
+    #[test]
+    fn truncated_bone_marker_is_skipped_not_panicking() {
+        // 18 bytes: the Bone marker is present at i = 8, but the BoneID read at i + 9 would run
+        // past the payload. The old code unwrapped that read and panicked; the scanner now skips
+        // the truncated record deterministically.
+        let mut d = vec![0u8; 18];
+        d[13..17].copy_from_slice(&CLASS_BONE.to_le_bytes());
+        assert!(parse_skeleton(&d).is_empty());
+    }
+
+    #[test]
+    fn complete_bone_record_still_parses() {
+        // i = 8: 9-byte object header + 4-byte BoneID + 1 parent byte + 9-byte transform header
+        // + 64 bytes of transforms = 95 bytes.
+        let mut full = vec![0u8; 8 + 9 + 4 + 1 + 9 + 64];
+        full[8] = 0;
+        full[13..17].copy_from_slice(&CLASS_BONE.to_le_bytes());
+        full[17..21].copy_from_slice(&0x1234u32.to_le_bytes());
+        let bones = parse_skeleton(&full);
+        assert_eq!(bones.len(), 1);
+        assert_eq!(bones[0].bone_id, 0x1234);
+    }
 }

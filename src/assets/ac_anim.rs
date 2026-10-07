@@ -105,30 +105,48 @@ fn object_ptr(r: &mut R) -> Result<Option<u32>, String> {
 /// The event tracks (payload 0x12: count, then AnimTrackEvent objects; `AnimTrackEvent__Serialize` 0x6DF4E0):
 /// u32 kind, u32 n, n × EventSeed, u32, then the AnimTrack key times (0x58D1C0: u16 k, k × u16).
 /// EventSeed (`EventSeed__Serialize` 0x525880): Event pointer, f32, u8, EventSeedLinkData pointer (u32, f32, u8).
-fn read_events(r: &mut R) -> Result<Vec<AnimEvent>, String> {
-    let n = r.u32()?;
+///
+/// The two error classes are kept apart: an event class the decoder does not implement is an
+/// unsupported layout (documented: FXEvent and one assassination event, 23 of 12,347 clips),
+/// while everything else is structurally invalid data that must not be swallowed.
+enum EventReadError {
+    Unsupported(String),
+    Corrupt(String),
+}
+
+fn read_events(r: &mut R) -> Result<Vec<AnimEvent>, EventReadError> {
+    let n = r.u32().map_err(EventReadError::Corrupt)? as usize;
+    // Each AnimTrackEvent consumes at least its object-pointer tag byte.
+    if n > r.remaining() {
+        return Err(EventReadError::Corrupt("event track count exceeds payload".into()));
+    }
     let mut out = Vec::new();
     for _ in 0..n {
-        if object_ptr(r)? != Some(CLASS_ANIM_TRACK_EVENT) {
-            return Err("not an AnimTrackEvent".into());
+        if object_ptr(r).map_err(EventReadError::Corrupt)? != Some(CLASS_ANIM_TRACK_EVENT) {
+            return Err(EventReadError::Corrupt("not an AnimTrackEvent".into()));
         }
-        let _kind = r.u32()?;
-        let ns = r.u32()? as usize;
+        let _kind = r.u32().map_err(EventReadError::Corrupt)?;
+        let ns = r.u32().map_err(EventReadError::Corrupt)? as usize;
+        // Each EventSeed consumes at least one tag byte; only allocate after proving the count.
+        if ns > r.remaining() {
+            return Err(EventReadError::Corrupt("event seed count exceeds payload".into()));
+        }
         let mut kinds = Vec::with_capacity(ns);
         for _ in 0..ns {
-            object_ptr(r)?; // the seed's class (ContactEventSeed, AudioEventSeed, …): EventSeed's fields
+            object_ptr(r).map_err(EventReadError::Corrupt)?; // the seed's class (ContactEventSeed, AudioEventSeed, …): EventSeed's fields
             let mut kind = None;
-            if let Some(class) = object_ptr(r)? {
-                let fields = event_fields(class).ok_or_else(|| format!("event class {class:08x}"))?;
-                r.u32()?; // Event: handle
+            if let Some(class) = object_ptr(r).map_err(EventReadError::Corrupt)? {
+                let fields = event_fields(class)
+                    .ok_or_else(|| EventReadError::Unsupported(format!("unsupported event class {class:08x}")))?;
+                r.u32().map_err(EventReadError::Corrupt)?; // Event: handle
                 let mut vals = Vec::new();
                 for f in fields.bytes() {
                     match f {
-                        b'u' => vals.push(r.u32()?),
-                        b'b' => vals.push(r.u8()? as u32),
+                        b'u' => vals.push(r.u32().map_err(EventReadError::Corrupt)?),
+                        b'b' => vals.push(r.u8().map_err(EventReadError::Corrupt)? as u32),
                         _ => {
-                            r.raw(12)?;
-                            vals.push(r.u32()?);
+                            r.raw(12).map_err(EventReadError::Corrupt)?;
+                            vals.push(r.u32().map_err(EventReadError::Corrupt)?);
                         }
                     }
                 }
@@ -138,21 +156,25 @@ fn read_events(r: &mut R) -> Result<Vec<AnimEvent>, String> {
                     c => EventKind::Other(c),
                 });
             }
-            r.f32()?;
-            r.u8()?;
-            if let Some(c) = object_ptr(r)? {
+            r.f32().map_err(EventReadError::Corrupt)?;
+            r.u8().map_err(EventReadError::Corrupt)?;
+            if let Some(c) = object_ptr(r).map_err(EventReadError::Corrupt)? {
                 if c != CLASS_EVENT_SEED_LINK {
-                    return Err("bad EventSeedLinkData".into());
+                    return Err(EventReadError::Corrupt("bad EventSeedLinkData".into()));
                 }
-                r.raw(9)?;
+                r.raw(9).map_err(EventReadError::Corrupt)?;
             }
             kinds.push(kind);
         }
-        r.u32()?;
-        let k = r.u16()? as usize;
+        r.u32().map_err(EventReadError::Corrupt)?;
+        let k = r.u16().map_err(EventReadError::Corrupt)? as usize;
+        // Each key time is a u16; bound the preallocation by the bytes that remain.
+        if k > r.remaining() / 2 {
+            return Err(EventReadError::Corrupt("event key count exceeds payload".into()));
+        }
         let mut times = Vec::with_capacity(k);
         for _ in 0..k {
-            times.push(r.u16()? as f32 / EVENT_TIME_SCALE);
+            times.push(r.u16().map_err(EventReadError::Corrupt)? as f32 / EVENT_TIME_SCALE);
         }
         out.extend(times.into_iter().zip(kinds).filter_map(|(time, k)| Some(AnimEvent { time, kind: k? })));
     }
@@ -166,6 +188,9 @@ struct R<'a> {
 }
 
 impl<'a> R<'a> {
+    fn remaining(&self) -> usize {
+        self.b.len().saturating_sub(self.o)
+    }
     fn need(&self, n: usize) -> Result<(), String> {
         if self.o + n > self.b.len() { Err(format!("overrun at {}", self.o)) } else { Ok(()) }
     }
@@ -326,13 +351,23 @@ fn read_track(r: &mut R) -> Result<(Vec<f32>, TrackValues), String> {
 
 /// Only the event tracks of an `Animation` payload.
 pub fn decode_events(payload: &[u8]) -> Result<Vec<AnimEvent>, String> {
-    read_events(&mut R { b: payload, o: 0x12 })
+    match read_events(&mut R { b: payload, o: 0x12 }) {
+        Ok(events) => Ok(events),
+        Err(EventReadError::Unsupported(e)) | Err(EventReadError::Corrupt(e)) => Err(e),
+    }
 }
 
 pub fn decode(payload: &[u8]) -> Result<AnimData, String> {
     let mut r = R { b: payload, o: 8 };
     let duration = r.f32()?;
-    let events = decode_events(payload).unwrap_or_default();
+    // An event class this decoder does not implement is an unsupported layout and keeps the
+    // documented empty-events fallback; any structurally invalid event region now fails instead
+    // of being silently converted into an empty event list.
+    let events = match read_events(&mut R { b: payload, o: 0x12 }) {
+        Ok(events) => events,
+        Err(EventReadError::Unsupported(_)) => Vec::new(),
+        Err(EventReadError::Corrupt(message)) => return Err(message),
+    };
     // skip header hash, flags and the reflected event tracks: find the AnimTrackData object
     let start = r.o;
     let pat = CLASS_ANIM_TRACK_DATA.to_le_bytes();
@@ -340,6 +375,10 @@ pub fn decode(payload: &[u8]) -> Result<AnimData, String> {
     r.o = i + 4;
     let _hash = r.u32()?;
     let nmap = r.u32()? as usize;
+    // Each track mapping is 12 bytes (object id + class + key); bound the allocation by what remains.
+    if nmap > r.remaining() / 12 {
+        return Err("track mapping count exceeds payload".into());
+    }
     let mut keys = Vec::with_capacity(nmap);
     for _ in 0..nmap {
         let _oid = r.u32()?;
@@ -350,6 +389,10 @@ pub fn decode(payload: &[u8]) -> Result<AnimData, String> {
     }
     let _u16 = r.u16()?;
     let ntr = r.u32()? as usize;
+    // Every track consumes a descriptor, an allocation size and a key count before its data.
+    if ntr > r.remaining() / 9 {
+        return Err("track count exceeds payload".into());
+    }
     let mut tracks = Vec::with_capacity(ntr);
     for k in 0..ntr {
         let (times, values) = read_track(&mut r)?;
@@ -376,4 +419,67 @@ pub fn bone_tracks(a: &AnimData) -> BoneTracks {
         }
     }
     (rot, pos)
+}
+
+#[cfg(test)]
+mod checked_decode_tests {
+    use super::*;
+
+    fn blank(len: usize) -> Vec<u8> {
+        vec![0u8; len]
+    }
+
+    #[test]
+    fn animation_mapping_count_bomb_is_rejected() {
+        // duration @8, empty event region @0x12, AnimTrackData @24, huge mapping count @32.
+        let mut p = blank(64);
+        p[18..22].copy_from_slice(&0u32.to_le_bytes());
+        p[24..28].copy_from_slice(&CLASS_ANIM_TRACK_DATA.to_le_bytes());
+        p[32..36].copy_from_slice(&u32::MAX.to_le_bytes());
+        let err = decode(&p).unwrap_err();
+        assert!(err.contains("track mapping count"), "{err}");
+    }
+
+    #[test]
+    fn animation_track_count_bomb_is_rejected() {
+        let mut p = blank(64);
+        p[18..22].copy_from_slice(&0u32.to_le_bytes());
+        p[24..28].copy_from_slice(&CLASS_ANIM_TRACK_DATA.to_le_bytes());
+        p[32..36].copy_from_slice(&0u32.to_le_bytes()); // mapping count 0
+        p[38..42].copy_from_slice(&u32::MAX.to_le_bytes()); // track count
+        let err = decode(&p).unwrap_err();
+        assert!(err.contains("track count"), "{err}");
+    }
+
+    #[test]
+    fn malformed_event_region_fails_instead_of_empty_events() {
+        // One event track whose object pointer is not an AnimTrackEvent: the old code folded this
+        // into an empty event list; it must now surface as a deterministic error.
+        let mut p = blank(40);
+        p[18..22].copy_from_slice(&1u32.to_le_bytes());
+        p[22] = 0; // inline object
+        p[27..31].copy_from_slice(&0xDEAD_BEEFu32.to_le_bytes()); // wrong class
+        let err = decode(&p).unwrap_err();
+        assert!(err.contains("not an AnimTrackEvent"), "{err}");
+    }
+
+    #[test]
+    fn unsupported_event_class_is_typed_not_corrupt() {
+        // A structurally valid track whose event class is unknown is reported as Unsupported so
+        // the documented empty-events fallback stays scoped to that case.
+        let mut p = blank(64);
+        p[18..22].copy_from_slice(&1u32.to_le_bytes()); // one track
+        p[22] = 0;
+        p[23..27].copy_from_slice(&1u32.to_le_bytes()); // object id
+        p[27..31].copy_from_slice(&CLASS_ANIM_TRACK_EVENT.to_le_bytes());
+        p[31..35].copy_from_slice(&0u32.to_le_bytes()); // kind
+        p[35..39].copy_from_slice(&1u32.to_le_bytes()); // one seed
+        p[39] = 2; // seed class pointer: reference
+        p[40..44].copy_from_slice(&0u32.to_le_bytes());
+        p[44] = 0; // event class pointer: inline
+        p[45..49].copy_from_slice(&5u32.to_le_bytes());
+        p[49..53].copy_from_slice(&0x1234_5678u32.to_le_bytes()); // unknown class
+        let result = read_events(&mut R { b: &p, o: 0x12 });
+        assert!(matches!(result, Err(EventReadError::Unsupported(_))));
+    }
 }

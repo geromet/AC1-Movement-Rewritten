@@ -59,6 +59,19 @@ fn marker(data: &[u8], class: &str) -> Result<usize, String> {
     Ok(candidates[0])
 }
 
+/// Decode an Entity-local `GuidanceSystem` from its payload. `marker` returns the position of the
+/// class hash, which in a valid record is preceded by the 4-byte object id; a marker at offset 0
+/// has no such prefix and must be rejected instead of underflowing the slice start. This is the
+/// exact caller used by `load_village`, kept separate so it can be exercised without a real forge.
+fn guidance_from_entity(payload: &[u8]) -> Result<crate::assets::world::NativeGuidance, String> {
+    if !payload.windows(4).any(|v| v == crc32("GuidanceSystem").to_le_bytes()) {
+        return Ok(default());
+    }
+    let g = marker(payload, "GuidanceSystem")?;
+    let start = g.checked_sub(4).ok_or("GuidanceSystem marker lacks its object id prefix")?;
+    crate::assets::world::parse_guidance(&payload[start..])
+}
+
 struct Part {
     placement: NativePlacement,
     mesh: StaticMesh,
@@ -111,10 +124,7 @@ pub(crate) fn load_village(game: &Path) -> Result<ImportedMap,String> {
             if !entity.payload.windows(4).any(|v|v == crc32("Visual").to_le_bytes()) { continue; }
             // PORT: animated vegetation/particles/actors require separate systems; this crop imports static space.
             if ["VEG_","Veg_","Countryside_","Plants_","BirdShit_"].iter().any(|prefix|entity.name.starts_with(prefix)) { continue; }
-            let guidance = if entity.payload.windows(4).any(|v|v==crc32("GuidanceSystem").to_le_bytes()) {
-                let g = marker(&entity.payload,"GuidanceSystem")?;
-                crate::assets::world::parse_guidance(&entity.payload[g-4..])?
-            } else { default() };
+            let guidance = guidance_from_entity(&entity.payload)?;
             let p = NativePlacement { id:entity.id, name:entity.name.clone(), transform:crate::assets::world::entity_transform(&entity.payload)?, guidance };
             let collision_count = map.collision.triangles.len();
             let guidance_count = map.guidance.edges.len();
@@ -286,6 +296,19 @@ pub(crate) fn spawn(In(map): In<ImportedMap>, mut commands: Commands, mut meshes
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn guidance_marker_at_offset_zero_is_rejected_without_underflow() {
+        // `marker` returns the offset of the GuidanceSystem class hash; a valid record is
+        // preceded by the 4-byte object id. A marker at offset 0 has no prefix and used to
+        // underflow `g - 4` in the load_village caller path this function replaces.
+        let payload = crc32("GuidanceSystem").to_le_bytes();
+        let err = guidance_from_entity(&payload).unwrap_err();
+        assert!(err.contains("object id prefix"), "{err}");
+        // No marker is the ordinary "no component" case and must still yield the default.
+        assert!(guidance_from_entity(b"no marker here").is_ok());
+    }
+
     #[test]
     fn native_village_loads_ground_and_connected_buildings() {
         let Some(game) = crate::assets::find_game_dir() else { return; };
