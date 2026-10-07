@@ -75,6 +75,30 @@ mod beam_warp_tests {
         assert!(w.root_at(0.14).distance(w.root_at(0.13)) < 0.1);
         assert!(w.root_at(0.3).y > target.y);
     }
+
+    /// AC1-REV-003: the authored collision normal, not a reconstructed cardinal face, drives wall-run admission.
+    #[test]
+    fn authored_angled_wall_normal_drives_admission() {
+        use crate::triangles::Triangle;
+        // an authored wall through (1, 1.3, 0) with outward unit normal `n`; the player probes +X from ZERO
+        let build = |n: Vec3| {
+            let n = Vec3::new(n.x, 0.0, n.z).normalize();
+            let e1 = Vec3::Y;
+            let e2 = n.cross(e1).normalize();
+            let p = Vec3::new(1.0, 1.3, 0.0);
+            let mut w = CollisionWorld::default();
+            w.triangles.push(Triangle::new([p - e1 - e2, p + e1 - e2, p + e2 * 2.0], crate::layers::STATIC).unwrap());
+            w
+        };
+        // 60° from the facing: the true authored normal rejects (dot(-f) = 0.5 < cos 45°)
+        let steep = build(Vec3::new(-0.5, 0.0, 0.866));
+        assert!(wall_ahead(Vec3::ZERO, Vec3::X, &steep).is_none(), "an authored 60° wall must be rejected");
+        // 30° from the facing: the query returns the authored normal and faces back within 45°
+        let shallow = build(Vec3::new(-0.866, 0.0, 0.5));
+        let hit = shallow.sweep_sphere(Vec3::Y * 1.3, Vec3::X * 1.5, 0.01, 0).expect("wall hit");
+        assert!(hit.normal.dot(Vec3::new(-0.866, 0.0, 0.5)) > 0.999, "authored normal: {:?}", hit.normal);
+        assert!(hit.normal.dot(Vec3::NEG_X) >= 45f32.to_radians().cos(), "30° wall should face back within 45°");
+    }
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -185,46 +209,33 @@ impl HumanWallingData {
 
 // ---------------------------------------------------------------- the wall ahead (0xE18390)
 
-/// Outward normal of the axis-aligned greybox face at `p` (the game takes the collision hit's normal).
-fn face_normal(p: Vec3, toward: Vec3, collision: &CollisionWorld) -> Vec3 {
-    let mut best = -toward;
-    let mut score = f32::MIN;
-    for n in [Vec3::X, Vec3::NEG_X, Vec3::Z, Vec3::NEG_Z] {
-        if collision.point_inside(p - n * 0.03) && !collision.point_inside(p + n * 0.03) {
-            let s = n.dot(-toward);
-            if s > score {
-                score = s;
-                best = n;
-            }
-        }
-    }
-    best
-}
-
 /// `HumanWalling` entry test (event 49 guard 0xDA2B10 → 0xE18390): a ray from 1.3·h above the feet along the
 /// facing, 1.5·h long; the wall must face back within 45° and extend about 0.5 m to both sides (0xE149E0); its
 /// slope (0xE14590 / 0xE14FB0) must be within 45°. Returns the warp target (hit + 0.5·h out, feet + h)
-/// and the outward normal.
+/// and the outward normal. The query returns the authored collision contact (AC1-REV-003): the game uses the
+/// collision hit's own normal, not a normal reconstructed from the greybox's cardinal faces.
 pub fn wall_ahead(feet: Vec3, forward: Vec3, collision: &CollisionWorld) -> Option<(Vec3, Vec3)> {
     let f = Vec3::new(forward.x, 0.0, forward.z).normalize_or_zero();
     let o = feet + Vec3::Y * (1.3 * H);
-    let d = collision.sphere_free_distance(o, f, 0.01, 1.5 * H);
-    if d >= 1.5 * H - 1e-3 {
+    let hit = collision.sweep_sphere(o, f * (1.5 * H), 0.01, 0)?;
+    if hit.distance >= 1.5 * H - 1e-3 {
         return None;
     }
-    let hit = o + f * d;
-    let n = face_normal(hit, f, collision);
+    // exact authored surface normal, oriented back toward the probe (the query orients it toward the sweep)
+    let n = hit.normal;
     if n.dot(-f) < 45f32.to_radians().cos() {
         return None;
     }
+    // the sphere centre at contact (the side probes are taken at the surface, ±0.5 m along the edge)
+    let centre = o + f * hit.distance;
     let side = right_of(-n);
     let solid = |p: Vec3| collision.point_inside(p - n * 0.05);
-    if !(solid(hit + side * 0.5) && solid(hit - side * 0.5)) {
+    if !(solid(centre + side * 0.5) && solid(centre - side * 0.5)) {
         return None;
     }
     // 0xE14590 probes 1 m higher only to measure the wall's slope (a vertical greybox wall: 0°); it does not
     // reject a wall that ends lower.
-    let contact = Vec3::new(hit.x, feet.y + H, hit.z) + n * (0.5 * H);
+    let contact = Vec3::new(centre.x, feet.y + H, centre.z) + n * (0.5 * H);
     Some((contact, n))
 }
 

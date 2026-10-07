@@ -825,13 +825,15 @@ pub fn try_free_hang_drop(
 /// rungs (sub_B18600), and flag 1860|0x10 switches to the Ladder context when the move ends.
 ///
 /// PORT: the probe is the horizontal distance to the ladder line (≤ 0.6 m) with the probe height inside the ladder
-/// ± 0.5 m; no clearance sweep; the rung snap is left to the ladder wait.
+/// ± 0.5 m; the native lateral capsule sweep (sub_B2A410, 1.8 m) is now modelled as a continuous capsule corridor
+/// sweep before the move is committed (AC1-REV-011), so a blocked corridor rejects the ladder.
 pub fn try_side_to_ladder(
     right: bool,
     n: Vec3,
     root: Vec3,
     hang: LedgeHangType,
     guidance: &GuidanceWorld,
+    collision: &CollisionWorld,
 ) -> Option<(LedgeMove, super::ladder::LadderEntry)> {
     use super::ladder::{LadderEntry, FROM_LEDGE_SIDE};
     let facing = -Vec3::new(n.x, 0.0, n.z).normalize_or_zero();
@@ -852,6 +854,10 @@ pub fn try_side_to_ladder(
             continue;
         }
         let to = q + ln * super::ladder::ATTACH_OUT;
+        // native lateral capsule sweep (sub_B2A410): the corridor from the hang to the ladder must be clear
+        if !collision.capsule_sweep_free(root, CAPSULE_HEIGHT, CAPSULE_RADIUS, to - root) {
+            continue;
+        }
         let id = FROM_LEDGE_SIDE[free as usize][right as usize];
         let seq = [single(id, 0), None, None, None];
         let durations = seq_durations(&seq);
@@ -1362,4 +1368,34 @@ pub fn pulldown_with(p: Vec3, n: Vec3, from: Vec3, orient_id: u32, descent_id: u
         )
     };
     Some([orient, descent, reception])
+}
+
+#[cfg(test)]
+mod corridor_tests {
+    use super::*;
+    use crate::collision::Aabb3;
+    use crate::guidance::{GuidanceEdge, GuidanceSubType, GuidanceWorld};
+
+    /// AC1-REV-011: the ledge-to-ladder move is refused when its corridor is blocked even though the ladder edge
+    /// and the endpoints are valid; the same geometry with a clear corridor is accepted.
+    #[test]
+    fn ladder_side_move_rejects_a_blocked_corridor() {
+        let n = Vec3::NEG_Z;
+        let root = Vec3::new(0.0, 5.0, 0.0);
+        let mut g = GuidanceWorld::default();
+        g.edges.push(GuidanceEdge {
+            p0: Vec3::new(1.0, 3.0, 0.0),
+            p1: Vec3::new(1.0, 7.0, 0.0),
+            n0: Vec3::Y,
+            n1: Vec3::NEG_Z,
+            subtype: GuidanceSubType::Ladder,
+        });
+        let clear = CollisionWorld::default();
+        assert!(try_side_to_ladder(false, n, root, LedgeHangType::Wall, &g, &clear).is_some(), "clear ladder corridor rejected");
+        let blocked = CollisionWorld {
+            boxes: vec![Aabb3 { min: Vec3::new(0.35, 3.0, -0.7), max: Vec3::new(0.65, 7.0, 0.1) }],
+            ..Default::default()
+        };
+        assert!(try_side_to_ladder(false, n, root, LedgeHangType::Wall, &g, &blocked).is_none(), "blocked ladder corridor accepted");
+    }
 }

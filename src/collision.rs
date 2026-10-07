@@ -103,6 +103,33 @@ pub struct Support {
     pub normal_y: f32,
 }
 
+/// Stable identity of the collider a continuous query hit. `Box` / `Triangle` index into the corresponding
+/// `CollisionWorld` collection, so a caller can name the exact source rather than a flat body slot.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ColliderId {
+    Box(usize),
+    Triangle(usize),
+}
+
+/// The result of a continuous swept-sphere query: exact authored contact geometry plus the collider identity and
+/// the query filter word actually used. This is the contact-returning primitive callers (wall-run entry, ledge /
+/// ladder clearance) consume instead of a bare scalar clearance.
+#[derive(Clone, Copy, Debug)]
+pub struct SweptSphereHit {
+    /// Contact point on the solid surface.
+    pub point: Vec3,
+    /// Authored outward surface normal at the contact, oriented toward the swept sphere's approach side.
+    pub normal: Vec3,
+    /// Hit fraction of the requested displacement, in [0, 1].
+    pub fraction: f32,
+    /// Distance travelled along the requested displacement before contact.
+    pub distance: f32,
+    /// Stable identity of the hit collider.
+    pub source: ColliderId,
+    /// Collision layer/filter word used for the query (0 = no filter, sees everything; `CollisionWorld::sees`).
+    pub layer: u8,
+}
+
 impl CollisionWorld {
     /// Capsule segment (sphere centres) for feet at `feet`, lifted by `lift`.
     fn segment(feet: Vec3, lift: f32) -> (Vec3, Vec3) {
@@ -181,24 +208,146 @@ impl CollisionWorld {
         hits.len() % 2 == 1
     }
 
-    /// Distance a sphere of radius `r` can travel from `origin` along `dir` before touching a box
-    /// (capped at `max`). Used for the shimmy free-space sweep (ProbeLateral 0xDD9640).
-    pub fn sphere_free_distance(&self, origin: Vec3, dir: Vec3, r: f32, max: f32) -> f32 {
-        let step = 0.02;
-        // Gather once for the entire sweep, rather than scanning the map at every 2 cm sample.
-        let end = origin + dir * (max + step);
-        let radius = Vec3::splat(r);
-        let candidates: Vec<_> = self.triangles_in_bounds(origin.min(end) - radius, origin.max(end) + radius).collect();
-        let mut d = 0.0;
-        while d < max {
-            let c = origin + dir * (d + step);
-            if self.boxes.iter().any(|b| (c - c.clamp(b.min, b.max)).length() < r)
-                || candidates.iter().any(|t| t.overlaps(c - radius, c + radius) && t.closest_point(c).distance_squared(c) < r * r) {
-                return d;
+    /// Continuous swept-sphere query: the earliest contact of a sphere of `radius` swept from `origin` along
+    /// `displacement`, within the sweep. Returns the exact authored contact point/normal, the fraction/distance
+    /// along the sweep and the collider identity. `layer` is the query filter word actually used (0 = no filter,
+    /// matching `CollisionWorld::sees`); the reviewed callers have no recovered native filter, so they pass 0.
+    ///
+    /// Unlike the old 2 cm sampler this computes a genuine time of impact against boxes (slab test on the
+    /// Minkowski-expanded box) and triangles (face plane, three edges and three vertices), so a thin obstacle
+    /// between path samples cannot be missed.
+    pub fn sweep_sphere(&self, origin: Vec3, displacement: Vec3, radius: f32, layer: u8) -> Option<SweptSphereHit> {
+        let mut best: Option<SweptSphereHit> = None;
+        let mut consider = |h: Option<SweptSphereHit>| {
+            if let Some(h) = h {
+                if best.as_ref().is_none_or(|b| h.fraction < b.fraction) {
+                    best = Some(h);
+                }
             }
-            d += step;
+        };
+        let r = Vec3::splat(radius);
+        let min = origin.min(origin + displacement) - r;
+        let max = origin.max(origin + displacement) + r;
+        for i in self.triangle_candidates(min, max) {
+            if !self.sees(layer, i) { continue; }
+            let t = &self.triangles[i - self.boxes.len()];
+            consider(self.sweep_sphere_triangle(origin, displacement, radius, t).map(|h| SweptSphereHit {
+                source: ColliderId::Triangle(i - self.boxes.len()),
+                layer,
+                ..h
+            }));
         }
-        max
+        for (i, b) in self.boxes.iter().enumerate() {
+            if !self.sees(layer, i) { continue; }
+            consider(self.sweep_sphere_box(origin, displacement, radius, b).map(|h| SweptSphereHit {
+                source: ColliderId::Box(i),
+                layer,
+                ..h
+            }));
+        }
+        best
+    }
+
+    /// Sweep a sphere against one AABB: exact slab test on the box expanded by the radius, with the contact normal
+    /// taken from the closest point on the original box (or the nearest face when the centre is inside).
+    fn sweep_sphere_box(&self, origin: Vec3, displacement: Vec3, radius: f32, b: &Aabb3) -> Option<SweptSphereHit> {
+        let emin = b.min - Vec3::splat(radius);
+        let emax = b.max + Vec3::splat(radius);
+        let (mut t0, mut t1) = (0.0f32, 1.0f32);
+        for k in 0..3 {
+            let d = displacement[k];
+            if d.abs() < 1e-9 {
+                if origin[k] < emin[k] || origin[k] > emax[k] { return None; }
+            } else {
+                let (mut ta, mut tb) = ((emin[k] - origin[k]) / d, (emax[k] - origin[k]) / d);
+                if ta > tb { std::mem::swap(&mut ta, &mut tb); }
+                t0 = t0.max(ta);
+                t1 = t1.min(tb);
+                if t0 > t1 { return None; }
+            }
+        }
+        let t = t0.clamp(0.0, 1.0);
+        let c = origin + displacement * t;
+        let q = c.clamp(b.min, b.max);
+        let d = c - q;
+        let len = d.length();
+        let normal = if len > 1e-6 { d / len } else { smallest_exit_axis(c, b) };
+        Some(SweptSphereHit { point: q, normal, fraction: t, distance: t * displacement.length(), source: ColliderId::Box(0), layer: 0 })
+    }
+
+    /// Continuous swept-sphere vs triangle (face plane, then the three edges, then the three vertices); the
+    /// earliest time of impact wins. The triangle is treated as a surface, so the returned authored normal is
+    /// orientated toward the side the sphere approached from.
+    fn sweep_sphere_triangle(&self, origin: Vec3, displacement: Vec3, radius: f32, t: &crate::triangles::Triangle) -> Option<SweptSphereHit> {
+        let r2 = radius * radius;
+        // Already touching at the start: contact at fraction 0.
+        let q0 = t.closest_point(origin);
+        if (q0 - origin).length_squared() < r2 {
+            let d = origin - q0;
+            let len = d.length();
+            return Some(SweptSphereHit {
+                point: q0,
+                normal: if len > 1e-6 { d / len } else { orient_normal(t.normal, displacement) },
+                fraction: 0.0,
+                distance: 0.0,
+                source: ColliderId::Triangle(0),
+                layer: 0,
+            });
+        }
+        let mut best: Option<SweptSphereHit> = None;
+        let mut keep = |point: Vec3, normal: Vec3, frac: f32| {
+            if frac >= -1e-6 && frac <= 1.0 + 1e-6 && best.as_ref().is_none_or(|b| frac < b.fraction) {
+                best = Some(SweptSphereHit { point, normal: normal.normalize_or(t.normal), fraction: frac.clamp(0.0, 1.0), distance: frac.clamp(0.0, 1.0) * displacement.length(), source: ColliderId::Triangle(0), layer: 0 });
+            }
+        };
+        // Face: signed plane distance s(t) = s0 + (displacement · n) t; the sphere touches the plane at |s| = r.
+        let n = t.normal;
+        let s0 = (origin - t.vertices[0]).dot(n);
+        let dn = displacement.dot(n);
+        if dn.abs() > 1e-9 {
+            let sigma = if s0 >= 0.0 { 1.0 } else { -1.0 };
+            let frac = (sigma * radius - s0) / dn;
+            if (-1e-6..=1.0 + 1e-6).contains(&frac) {
+                let c = origin + displacement * frac.clamp(0.0, 1.0);
+                let proj = c - n * sigma * radius;
+                if t.closest_point(proj).distance_squared(proj) < 1e-8 {
+                    keep(proj, n * sigma, frac);
+                }
+            }
+        }
+        // Edges.
+        for (a, bb) in [(t.vertices[0], t.vertices[1]), (t.vertices[1], t.vertices[2]), (t.vertices[2], t.vertices[0])] {
+            if let Some((point, normal, frac)) = sphere_triangle_edge(origin, displacement, radius, a, bb) {
+                keep(point, normal, frac);
+            }
+        }
+        // Vertices.
+        for v in t.vertices {
+            if let Some((frac, normal)) = sphere_point_roots(origin - v, displacement, radius) {
+                keep(v, normal, frac);
+            }
+        }
+        best
+    }
+
+    /// Continuous corridor test for a translating capsule: does a capsule (bottom at `from`, `height`, radius `r`)
+    /// moved by `displacement` stay clear of the world? Each sphere on the capsule axis is swept continuously
+    /// (exact time of impact), so the path itself is never sampled; only the shape's axis is sampled, which is a
+    /// conservative shape approximation. Used before committing a traversal interpolation.
+    pub fn capsule_sweep_free(&self, from: Vec3, height: f32, r: f32, displacement: Vec3) -> bool {
+        let lo = r;
+        let hi = (height - r).max(r);
+        let rings = (((hi - lo) / (r * 0.5)).ceil() as usize).max(1);
+        (0..=rings).all(|k| {
+            let y = lo + (hi - lo) * (k as f32 / rings as f32);
+            self.sweep_sphere(from + Vec3::Y * y, displacement, r, 0).is_none()
+        })
+    }
+
+    /// Distance a sphere of radius `r` can travel from `origin` along `dir` before touching a box
+    /// (capped at `max`). Delegates to the continuous `sweep_sphere`, replacing the fixed 2 cm sampler.
+    pub fn sphere_free_distance(&self, origin: Vec3, dir: Vec3, r: f32, max: f32) -> f32 {
+        self.sweep_sphere(origin, dir * max, r, 0).map(|h| h.distance).unwrap_or(max)
     }
 
     /// Would a standing capsule fit with its feet at `feet`?
@@ -349,6 +498,79 @@ fn smallest_exit_axis(p: Vec3, b: &Aabb3) -> Vec3 {
     cands.iter().min_by(|x, y| x.0.total_cmp(&y.0)).unwrap().1
 }
 
+/// Orient an authored face normal toward the incoming sweep, so a hit normal always points from the solid
+/// back toward the query shape (the `Contact` convention).
+fn orient_normal(n: Vec3, displacement: Vec3) -> Vec3 {
+    if n.dot(displacement) > 0.0 { -n } else { n }
+}
+
+/// Earliest root in [0, 1] of a point moving by `displacement` from `rel` that is at distance `radius` from the
+/// origin: |rel + displacement·t| = radius. Returns (fraction, outward normal from the point toward the centre).
+fn sphere_point_roots(rel: Vec3, displacement: Vec3, radius: f32) -> Option<(f32, Vec3)> {
+    let a = displacement.length_squared();
+    if a < 1e-12 {
+        return None;
+    }
+    let b = 2.0 * rel.dot(displacement);
+    let c = rel.length_squared() - radius * radius;
+    let disc = b * b - 4.0 * a * c;
+    if disc < 0.0 {
+        return None;
+    }
+    let t = (-b - disc.sqrt()) / (2.0 * a);
+    if !(-1e-6..=1.0 + 1e-6).contains(&t) {
+        return None;
+    }
+    let tc = t.clamp(0.0, 1.0);
+    let normal = (rel + displacement * tc).normalize_or(Vec3::Y);
+    Some((tc, normal))
+}
+
+/// Earliest contact in [0, 1] of a sphere swept along `displacement` against the static segment [a, b]:
+/// perpendicular distance = radius with the projection inside the segment. Returns (point, normal, fraction).
+fn sphere_triangle_edge(origin: Vec3, displacement: Vec3, radius: f32, a: Vec3, b: Vec3) -> Option<(Vec3, Vec3, f32)> {
+    let e = b - a;
+    let el2 = e.length_squared();
+    if el2 < 1e-12 {
+        return None;
+    }
+    let w0 = origin - a;
+    let de = displacement.dot(e) / el2;
+    let w0e = w0.dot(e) / el2;
+    let w0p = w0 - e * w0e;
+    let dp = displacement - e * de;
+    let (qa, qb, qc) = (dp.length_squared(), 2.0 * w0p.dot(dp), w0p.length_squared() - radius * radius);
+    if qa < 1e-12 {
+        return None;
+    }
+    let disc = qb * qb - 4.0 * qa * qc;
+    if disc < 0.0 {
+        return None;
+    }
+    let sqrt = disc.sqrt();
+    let mut best: Option<(Vec3, Vec3, f32)> = None;
+    for t in [(-qb - sqrt) / (2.0 * qa), (-qb + sqrt) / (2.0 * qa)] {
+        if !(-1e-6..=1.0 + 1e-6).contains(&t) {
+            continue;
+        }
+        let tc = t.clamp(0.0, 1.0);
+        let alpha = w0e + de * tc;
+        if !(-1e-6..=1.0 + 1e-6).contains(&alpha) {
+            continue;
+        }
+        let point = a + e * alpha.clamp(0.0, 1.0);
+        let normal = origin + displacement * tc - point;
+        let len = normal.length();
+        if len < 1e-9 {
+            continue;
+        }
+        if best.as_ref().is_none_or(|x| tc < x.2) {
+            best = Some((point, normal / len, tc));
+        }
+    }
+    best
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -400,5 +622,48 @@ mod tests {
         assert!(s.y < 3.0 && s.y > 2.9, "{s:?}");
         // 0.3 m past (contact > 45°, 0.4·sin45 = 0.283): falls
         assert!(on(0.3).is_none());
+    }
+
+    use crate::triangles::Triangle;
+
+    /// AC1-REV-003 / reusable continuous query: a hit carries the authored contact point, exact authored normal,
+    /// fraction/distance and the collider identity.
+    #[test]
+    fn continuous_sweep_returns_the_authored_contact_and_identity() {
+        // a vertical +/-X wall triangle at x = 1, normal +X
+        let mut w = CollisionWorld::default();
+        w.triangles.push(Triangle::new([Vec3::new(1.0, -1.0, -1.0), Vec3::new(1.0, 1.0, -1.0), Vec3::new(1.0, 0.0, 1.0)], crate::layers::STATIC).unwrap());
+        let hit = w.sweep_sphere(Vec3::new(0.0, 0.0, 0.0), Vec3::X * 2.0, 0.05, 0).expect("wall hit");
+        assert!(hit.normal.dot(Vec3::NEG_X) > 0.999, "authored normal (oriented to the sweep): {:?}", hit.normal);
+        assert!((hit.fraction - 0.475).abs() < 1e-3, "fraction {}", hit.fraction);
+        assert!((hit.distance - 0.95).abs() < 1e-3, "distance {}", hit.distance);
+        assert!((hit.point.x - 1.0).abs() < 1e-4, "contact point {:?}", hit.point);
+        assert_eq!(hit.source, ColliderId::Triangle(0));
+        assert_eq!(hit.layer, 0);
+    }
+
+    /// AC1-REV-009: a thin obstacle between the old 2 cm samples is found by the continuous sweep.
+    #[test]
+    fn continuous_sweep_finds_a_thin_obstacle_between_old_samples() {
+        // a tiny vertical triangle near (0.01, 0.005, 0); the old sampler only tested x = 0.02, 0.04, … and
+        // missed it because the closest approach (0.005 m) is inside the 0.01 m radius.
+        let mut w = CollisionWorld::default();
+        w.triangles.push(Triangle::new([
+            Vec3::new(0.01, 0.0, -0.002),
+            Vec3::new(0.01, 0.01, 0.001),
+            Vec3::new(0.01, 0.005, 0.002),
+        ], crate::layers::STATIC).unwrap());
+        let hit = w.sweep_sphere(Vec3::ZERO, Vec3::X, 0.01, 0).expect("thin obstacle found");
+        assert_eq!(hit.source, ColliderId::Triangle(0));
+        assert!(w.sphere_free_distance(Vec3::ZERO, Vec3::X, 0.01, 1.0) < 1.0, "clearance must stop short");
+    }
+
+    /// AC1-REV-011: the corridor primitive rejects a thin blocker crossing the path but accepts a clear one.
+    #[test]
+    fn capsule_corridor_rejects_a_blocked_midpoint() {
+        let empty = CollisionWorld::default();
+        assert!(empty.capsule_sweep_free(Vec3::ZERO, CAPSULE_HEIGHT, CAPSULE_RADIUS, Vec3::X * 2.0));
+        let blocked = CollisionWorld { boxes: vec![Aabb3 { min: Vec3::new(0.9, -1.0, -0.3), max: Vec3::new(1.1, 3.0, 0.3) }], ..Default::default() };
+        assert!(!blocked.capsule_sweep_free(Vec3::ZERO, CAPSULE_HEIGHT, CAPSULE_RADIUS, Vec3::X * 2.0), "thin blocker crossed");
     }
 }

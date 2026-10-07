@@ -156,8 +156,11 @@ fn closest_points(world: &CollisionWorld, layer: u8, p: Vec3, lift: f32) -> Vec<
 /// The linear cast of the shape from `p` by `disp` (0x57B200 with the cast collector), hits sorted by fraction
 /// (sub_FE4FC0). Each hit carries the fraction and the distance along its normal (−disp·n × fraction, 0x579870).
 /// PORT: conservative advancement against each box; boxes the shape already touches at the start are left to the
-/// closest-point query.
+/// closest-point query. The advancement budget bounds work only: exhausting it is **not** a clear path (AC1-REV-002)
+/// — the move is conservatively rejected at the last advanced fraction instead.
 fn linear_cast(world: &CollisionWorld, layer: u8, p: Vec3, disp: Vec3, lift: f32) -> Vec<Contact> {
+    /// Contact tolerance of the advancement loop.
+    const CAST_EPS: f32 = 1e-4;
     let len = disp.length();
     let mut hits = Vec::new();
     if len < 1e-7 {
@@ -174,22 +177,31 @@ fn linear_cast(world: &CollisionWorld, layer: u8, p: Vec3, disp: Vec3, lift: f32
             continue;
         }
         let mut hit = false;
+        let mut passed_end = false;
         for _ in 0..40 {
-            if c.dist <= 1e-4 {
+            if c.dist <= CAST_EPS {
                 hit = true;
                 break;
             }
             t += c.dist / len;
             if t > 1.0 {
+                // the contact is beyond the requested sweep: a genuine clear for this collider
+                passed_end = true;
                 break;
             }
             c = closest(world, i, p + disp * t, lift);
         }
-        if hit {
-            c.fraction = t;
-            c.dist = -disp.dot(c.normal) * t;
-            hits.push(c);
+        if !hit && !passed_end {
+            // Non-convergence: the advancement budget ran out while still approaching. Report a conservative
+            // contact at the last advanced fraction so the proxy stops early instead of crossing the surface.
+            t = t.clamp(0.0, 1.0);
+            c = closest(world, i, p + disp * t, lift);
+        } else if !hit {
+            continue;
         }
+        c.fraction = t;
+        c.dist = -disp.dot(c.normal) * t;
+        hits.push(c);
     }
     hits.sort_by(|a, b| a.fraction.total_cmp(&b.fraction));
     hits
@@ -696,5 +708,37 @@ mod tests {
         let (y, normal_y) = stick_to_ground(&w, Vec3::new(0.0,0.3,0.0), 0.37, 0.58).unwrap();
         assert!(y.abs() < 0.02 && normal_y > 0.97, "{y} {normal_y}");
         assert!(w.floor_height_below(Vec3::new(4.5,1.0,4.5),2.0).is_none(), "outside the face, inside its AABB");
+    }
+
+    /// AC1-REV-002: at shallow incidence the bounded conservative advancement can exhaust its budget while still
+    /// approaching. Exhaustion must never read as a clear path, and neither one large step nor the same move
+    /// subdivided may cross the wall.
+    #[test]
+    fn shallow_incidence_advancement_exhaustion_is_never_a_clear_path() {
+        let w = boxes(&[(Vec3::new(1.0, -1.0, -10.0), Vec3::new(2.0, 3.0, 10.0))]);
+        let rs = CAPSULE_RADIUS - KEEP_DISTANCE;
+        // shape centre 0.101 m from the wall, then 0.102 m into it and 0.75 m tangentially
+        let p = Vec3::new(1.0 - rs - 0.101, 1.0, 0.0);
+        let disp = Vec3::new(0.102, 0.0, 0.75);
+        let hits = linear_cast(&w, crate::layers::MAIN_CHARACTER, p, disp, 0.0);
+        assert!(!hits.is_empty(), "non-convergent advancement must not report a clear path");
+        assert!(hits[0].fraction <= 1.0 + 1e-5, "{:?}", hits[0]);
+        // one large step
+        let big = integrate(&w, &mut ProxyState::default(), p, disp, 1.0, 0.0).0;
+        assert!(big.x + rs <= 1.0 + 1e-3, "large step crossed the wall: {big:?}");
+        // the same move subdivided
+        let mut s = ProxyState::default();
+        let mut q = p;
+        for _ in 0..50 {
+            q = integrate(&w, &mut s, q, disp / 50.0, 1.0, 0.0).0;
+        }
+        assert!(q.x + rs <= 1.0 + 1e-3, "subdivided move crossed the wall: {q:?}");
+    }
+
+    #[test]
+    fn linear_cast_reports_no_hit_only_when_genuinely_clear() {
+        let w = boxes(&[(Vec3::new(5.0, -1.0, -5.0), Vec3::new(6.0, 3.0, 5.0))]);
+        let hits = linear_cast(&w, crate::layers::MAIN_CHARACTER, Vec3::new(0.0, 1.0, 0.0), Vec3::Z * 2.0, 0.0);
+        assert!(hits.is_empty(), "a genuinely clear sweep must report no hit");
     }
 }

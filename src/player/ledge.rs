@@ -242,9 +242,10 @@ pub fn hang_root_at(hand_l: Vec3, hand_r: Vec3, n: Vec3, hang: LedgeHangType, co
 /// −1.2, −0.6, 0, +0.6): `band` 0 up (feet −0.6, hands +0.6), 1 level (feet −1.2, hands 0), 2 down (feet −1.8, hands
 /// −0.6). Both hands go to the hand row's hold and both feet to the feet row's (climb pose 0), then the transition
 /// `LEDGE_SIDE_TO_CLIMB` plays. PORT: the rows are guidance probes (r 0.5, vertical 0.3) one shimmy step along the
-/// move; the game's clearance tests (sub_B2DF90, lateral 1.8 m sub_B2A410) are not modelled.
+/// move; the native clearance tests (sub_B2DF90, lateral 1.8 m sub_B2A410) are now modelled as a continuous
+/// capsule corridor sweep before the move is committed (AC1-REV-011).
 #[allow(clippy::too_many_arguments)]
-fn side_climb_entry(band: usize, right: bool, mover: Vec3, dv: Vec3, step: f32, n: Vec3, hang: LedgeHangType, feet: Vec3, guidance: &GuidanceWorld) -> Option<ClimbEntry> {
+fn side_climb_entry(band: usize, right: bool, mover: Vec3, dv: Vec3, step: f32, n: Vec3, hang: LedgeHangType, feet: Vec3, guidance: &GuidanceWorld, collision: &CollisionWorld) -> Option<ClimbEntry> {
     let facing = -Vec3::new(n.x, 0.0, n.z).normalize_or_zero();
     let (fy, hy) = [(-0.6, 0.6), (-1.2, 0.0), (-1.8, -0.6)][band];
     let row = |y: f32| {
@@ -254,6 +255,11 @@ fn side_climb_entry(band: usize, right: bool, mover: Vec3, dv: Vec3, step: f32, 
             .map(|h| h.point)
     };
     let (foot, hand) = (row(fy)?, row(hy)?);
+    // native clearance before committing the climb interpolation (sub_B2DF90): the corridor must be clear
+    let to = super::climb::climb_root_at(hand, hand, foot, foot, n);
+    if !collision.capsule_sweep_free(feet, CAPSULE_HEIGHT, CAPSULE_RADIUS, to - feet) {
+        return None;
+    }
     Some(ClimbEntry {
         entry_type: ClimbEntryType::FromLedge,
         hand_l: hand,
@@ -658,7 +664,7 @@ pub fn update_ledge(
             LedgeDir::Left | LedgeDir::Right => {
                 d.blocked_up = false;
                 // TrySideMoveToLadder 0xDD4CD0 (`sub_DD4CD0(dir, 8, 0)`): a ladder at the side comes first
-                if let Some((mv, e)) = ledge_moves::try_side_to_ladder(dir == LedgeDir::Right, n, body.feet, d.hang_type, &guidance) {
+                if let Some((mv, e)) = ledge_moves::try_side_to_ladder(dir == LedgeDir::Right, n, body.feet, d.hang_type, &guidance, &collision) {
                     start_move(d, mv, "side to ladder");
                     d.then_ladder = Some(e);
                     continue;
@@ -691,7 +697,7 @@ pub fn update_ledge(
                     // Movement_ChooseAction 0xDE29E0 with the preference +1856 = 0 (the ctor's value; nothing else sets
                     // it): climb holds down, then level, before the shimmy
                     for band in [2usize, 1] {
-                        if let Some(e) = side_climb_entry(band, dir == LedgeDir::Right, mover, dv, step, n, d.hang_type, body.feet, &guidance) {
+                        if let Some(e) = side_climb_entry(band, dir == LedgeDir::Right, mover, dv, step, n, d.hang_type, body.feet, &guidance, &collision) {
                             switch_context(&mut loco, &mut data, TransitionSetup::ToClimb(e));
                             continue 'players;
                         }
@@ -715,7 +721,7 @@ pub fn update_ledge(
                     let right_dir = dir == LedgeDir::Right;
                     // no shimmy step: climb holds up (preference 0, 0xDE2C7D)
                     if let Some(step) = side_step {
-                        if let Some(e) = side_climb_entry(0, right_dir, mover, dv, step, n, d.hang_type, body.feet, &guidance) {
+                        if let Some(e) = side_climb_entry(0, right_dir, mover, dv, step, n, d.hang_type, body.feet, &guidance, &collision) {
                             switch_context(&mut loco, &mut data, TransitionSetup::ToClimb(e));
                             continue;
                         }
@@ -756,5 +762,39 @@ pub fn update_ledge(
                 d.last_action = if dir == LedgeDir::Right { "shimmy right" } else { "shimmy left" };
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod corridor_tests {
+    use super::*;
+    use crate::collision::Aabb3;
+    use crate::guidance::{GuidanceEdge, GuidanceSubType, GuidanceWorld};
+
+    /// AC1-REV-011: the ledge-to-climb side entry is refused when its corridor is blocked even though both the
+    /// hand and foot hold rows and the endpoints are valid; the clear corridor is accepted.
+    #[test]
+    fn side_climb_entry_rejects_a_blocked_corridor() {
+        let n = Vec3::NEG_Z;
+        let dv = Vec3::X;
+        let mover = Vec3::new(0.0, 5.0, 0.0);
+        let feet = Vec3::new(0.0, 5.0, 0.0);
+        let row = |y: f32| GuidanceEdge {
+            p0: Vec3::new(-1.0, y, 0.0),
+            p1: Vec3::new(2.0, y, 0.0),
+            n0: Vec3::Y,
+            n1: Vec3::NEG_Z,
+            subtype: GuidanceSubType::LedgeGrab,
+        };
+        let mut g = GuidanceWorld::default();
+        g.edges.push(row(4.4)); // band 0 feet row (−0.6)
+        g.edges.push(row(5.6)); // band 0 hands row (+0.6)
+        let clear = CollisionWorld::default();
+        assert!(side_climb_entry(0, true, mover, dv, 0.5, n, LedgeHangType::Wall, feet, &g, &clear).is_some(), "clear climb corridor rejected");
+        let blocked = CollisionWorld {
+            boxes: vec![Aabb3 { min: Vec3::new(0.15, 3.0, -0.6), max: Vec3::new(0.45, 7.0, 0.3) }],
+            ..Default::default()
+        };
+        assert!(side_climb_entry(0, true, mover, dv, 0.5, n, LedgeHangType::Wall, feet, &g, &blocked).is_none(), "blocked climb corridor accepted");
     }
 }
