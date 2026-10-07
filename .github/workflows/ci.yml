@@ -1,0 +1,80 @@
+name: zero-data-validation
+
+# Public, zero-data CI boundary for AC1 Movement Rewritten.
+#
+# It requires no proprietary AC1 assets and no repository secrets: the game
+# data is supplied by the user at runtime and is never bundled or fetched.
+# See docs/VALIDATION.md for exactly what a green run certifies.
+#
+# This workflow runs `cargo check` and `cargo test`, then hands the captured
+# test log to scripts/check-zero-data.sh, which enforces the skip/ignore
+# inventory and the required-data hard-fail mode.
+
+on:
+  push:
+    branches:
+      - main
+      - "review/**"
+  pull_request:
+    branches:
+      - main
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: zero-data-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  zero-data:
+    name: cargo check + test (no game data)
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install headless system dependencies for Bevy
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            libasound2-dev \
+            libudev-dev \
+            libwayland-dev \
+            libxkbcommon-dev \
+            pkg-config
+
+      - name: Install Rust 1.98.1
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.98.1
+
+      - name: Cache cargo build
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-
+
+      - name: cargo check (zero-data)
+        run: cargo check --locked
+
+      - name: cargo test (zero-data, skip-visible)
+        run: cargo test --locked -- --nocapture --test-threads=1 2>&1 | tee ac1-zero-data-test.log
+
+      - name: Enforce the zero-data boundary
+        run: AC_SKIP_CHECK=1 AC_TEST_LOG=ac1-zero-data-test.log bash scripts/check-zero-data.sh
+
+      - name: Upload zero-data test log
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ac1-zero-data-test-log
+          path: ac1-zero-data-test.log
+          if-no-files-found: ignore

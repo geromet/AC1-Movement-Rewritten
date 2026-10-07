@@ -14,3 +14,10 @@ opt-level = 1
 
 [profile.dev.package."*"]
 opt-level = 3
+
+# Zero-data validation boundary (see docs/VALIDATION.md and
+# scripts/check-zero-data.sh). Declared explicitly so the required-data gate is
+# a named, discoverable test target rather than relying on path autodiscovery.
+[[test]]
+name = "zero_data_boundary"
+path = "tests/zero_data_boundary.rs"
