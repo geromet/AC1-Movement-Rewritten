@@ -222,6 +222,145 @@ fn contact_state(c: &AnimClip, t: f32) -> ContactState {
     s
 }
 
+/// The outgoing (A) side of a running blend (`sub_773F90`). It is *evaluatable*: when the blend keeps A
+/// playing (AROLLB* kinds) `roll` samples A's pose, root and contacts at ONE advancing phase, so pose and
+/// root can never diverge; when A is frozen the pose/root/contacts captured on screen stay put. The captured
+/// `anchor_*` is the composite that was on screen when the blend started, so interrupting an earlier blend
+/// advances that composite by the rolling item's motion instead of discarding it for a pure re-sample
+/// (AC1-REV-012). PORT: native nested blend-tree evaluation of a still-fading A is not recovered; the anchor
+/// is advanced by the currently rolling item only.
+#[derive(Clone, Debug, Default)]
+struct OutgoingA {
+    /// Pose on screen when the blend started (per joint); the continuity anchor while rolling.
+    anchor_pose: Vec<(Quat, Vec3)>,
+    /// Root translation on screen when the blend started (player-local).
+    anchor_root: Vec3,
+    /// Contact tags when the blend started (ACTBlendAcuatorMode FROMA).
+    anchor_contacts: ContactState,
+    /// A still playing while the blend runs (AROLLB* kinds), if any.
+    roll: Option<RollA>,
+}
+
+/// A keeps playing while the blend runs: the item list / item / looping and the phase it had when the blend
+/// started. Pose and root are both derived from the same advancing `phase`.
+#[derive(Clone, Debug)]
+struct RollA {
+    items: Vec<ItemPlay>,
+    item: usize,
+    phase: f32,
+    looping: bool,
+    /// Phase at capture; the samples at this phase are the delta origin.
+    base_phase: f32,
+    /// Lazily captured pose/root at `base_phase` (the blend starts before this frame's samples exist).
+    base_pose: Option<Vec<(Quat, Vec3)>>,
+    base_root: Option<Vec3>,
+}
+
+impl OutgoingA {
+    /// Capture what is on screen plus the still-playing A state, if the blend keeps A rolling.
+    fn capture(anchor_pose: Vec<(Quat, Vec3)>, anchor_root: Vec3, anchor_contacts: ContactState, a_state: Option<(Vec<ItemPlay>, usize, f32, bool)>) -> Self {
+        let roll = a_state.and_then(|(items, item, phase, looping)| {
+            (!items.is_empty()).then_some(RollA { items, item, phase, looping, base_phase: phase, base_pose: None, base_root: None })
+        });
+        OutgoingA { anchor_pose, anchor_root, anchor_contacts, roll }
+    }
+
+    /// Advance the rolling item's own clock once per frame.
+    fn advance(&mut self, lib: &AnimLibrary, dt: f32) {
+        let Some(r) = self.roll.as_mut() else { return };
+        let ad = r.items.get(r.item).map(|it| lib.item_duration(it)).unwrap_or(1.0).max(1e-3);
+        let n = r.phase + dt / ad;
+        r.phase = if r.looping { n.fract() } else { n.min(1.0) };
+    }
+
+    /// The pose to blend from this frame: the on-screen anchor advanced by the rolling item's local motion
+    /// since capture. At capture the delta is zero, so interrupting an earlier blend keeps its composite pose.
+    fn pose(&mut self, lib: &AnimLibrary, rig: &Rig) -> Vec<(Quat, Vec3)> {
+        if self.roll.is_none() {
+            return self.anchor_pose.clone();
+        }
+        let anchor = &self.anchor_pose;
+        let r = self.roll.as_mut().unwrap();
+        let Some(item) = r.items.get(r.item) else { return anchor.clone() };
+        let mut cur = Vec::new();
+        sample_layers(lib, rig, &item.layers, r.phase, &mut cur);
+        if r.base_pose.is_none() {
+            let mut base = Vec::new();
+            sample_layers(lib, rig, &item.layers, r.base_phase, &mut base);
+            r.base_pose = Some(base);
+        }
+        let base = r.base_pose.as_ref().unwrap();
+        if cur.len() != anchor.len() || base.len() != cur.len() {
+            return cur;
+        }
+        cur.iter()
+            .zip(anchor.iter())
+            .zip(base.iter())
+            .map(|((c, a), a0)| ((a.0 * (a0.0.inverse() * c.0)).normalize(), a.1 + (c.1 - a0.1)))
+            .collect()
+    }
+
+    /// The root translation to blend from this frame, advanced by the same rolling item / phase as `pose`.
+    fn root(&mut self, lib: &AnimLibrary) -> Vec3 {
+        if self.roll.is_none() {
+            return self.anchor_root;
+        }
+        let r = self.roll.as_mut().unwrap();
+        let Some(item) = r.items.get(r.item) else { return self.anchor_root };
+        let cur = item_root_translation(lib, item, r.phase, r.looping);
+        if r.base_root.is_none() {
+            r.base_root = Some(item_root_translation(lib, item, r.base_phase, r.looping));
+        }
+        self.anchor_root + (cur - r.base_root.unwrap())
+    }
+
+    /// A's contact tags this frame (the rolling item's, else the ones captured at the blend start).
+    fn contacts(&self, lib: &AnimLibrary) -> ContactState {
+        match &self.roll {
+            Some(r) => r.items.get(r.item).and_then(|it| lib.dominant(it)).map(|c| contact_state(c, r.phase * c.duration)).unwrap_or(self.anchor_contacts),
+            None => self.anchor_contacts,
+        }
+    }
+}
+
+/// Player-local root translation of `item` at `phase` when it drives root motion
+/// (`ACTDisplacementMode::FromAnim`, one-shot): the DISPLACEMENT track minus the linear path.
+fn item_root_translation(lib: &AnimLibrary, item: &ItemPlay, phase: f32, looping: bool) -> Vec3 {
+    if looping || !item.root_motion {
+        return Vec3::ZERO;
+    }
+    let mut off = Vec3::ZERO;
+    let mut wsum = 0.0;
+    for (n, w) in &item.layers {
+        if let Some(c) = lib.clips.get(n) {
+            off += root_motion_offset(c, phase) * *w;
+            wsum += *w;
+        }
+    }
+    if wsum > 0.0 { anim_root().rotation * (off / wsum) } else { Vec3::ZERO }
+}
+
+/// Root translation of a running blend (`ACTBlendDispSrcMode`): 1 FROMAONLY uses A, 2 FROMBONLY uses B,
+/// otherwise BLENDAB interpolates A → B by the blend weight.
+fn blend_root(a_root: Vec3, b_root: Vec3, disp_src: u8, weight: f32) -> Vec3 {
+    match disp_src {
+        1 => a_root,
+        2 => b_root,
+        _ => a_root.lerp(b_root, weight),
+    }
+}
+
+/// Blend the outgoing pose into the incoming one by `weight` (the game's per-joint interpolation). The
+/// outgoing pose must have the same joint count; otherwise the incoming pose is used as-is.
+fn blend_full_pose(prev: &[(Quat, Vec3)], cur: &[(Quat, Vec3)], weight: f32) -> Vec<(Quat, Vec3)> {
+    (0..cur.len())
+        .map(|i| match prev.get(i) {
+            Some(&(r0, p0)) => (qinterp(r0, cur[i].0, weight), p0.lerp(cur[i].1, weight)),
+            None => cur[i],
+        })
+        .collect()
+}
+
 /// Playback state on the player.
 #[derive(Component, Default)]
 pub struct AnimPlayer {
@@ -230,12 +369,6 @@ pub struct AnimPlayer {
     pub items: Vec<ItemPlay>,
     pub item: usize,
     pub phase: f32,
-    /// The pose on screen when the current transition started (per joint), faded out over `fade_time`.
-    /// PORT: the game's blend tree keeps the outgoing item running; the port freezes the displayed pose, which
-    /// also covers a transition that starts while another is still fading (no snap).
-    pub prev: Option<Vec<(Quat, Vec3)>>,
-    /// Root-joint translation on screen when the transition started (root-motion offset of a FromAnim clip).
-    prev_root: Vec3,
     /// The last displayed pose and root translation (before IK).
     last_pose: Vec<(Quat, Vec3)>,
     last_root: Vec3,
@@ -247,10 +380,9 @@ pub struct AnimPlayer {
     /// The running blend (`ActionBlend` of the transition or item seam): its type decides whether A (outgoing) and B
     /// (incoming) keep playing, its flags the weight curve, its modes where root motion and contacts come from.
     pub blend: ActBlend,
-    /// A still playing while the blend runs (AROLLB* types): its items, item and phase.
-    a_roll: Option<(Vec<ItemPlay>, usize, f32, bool)>,
-    /// A's contact tags when the blend started (ACTBlendAcuatorMode FROMA).
-    prev_contacts: ContactState,
+    /// The outgoing (A) side of a running blend, if any: ONE coherent evaluatable state so pose, root and
+    /// contacts can never advance from different A snapshots (AC1-REV-012).
+    outgoing: Option<OutgoingA>,
     /// The action sequence loops back to this item (the items before it are a transition action).
     loop_from: usize,
     /// The simulation's phase applies from this item on (the items before it are a transition action playing on its
@@ -974,7 +1106,7 @@ fn choose_clip(
         }
         if std::env::var_os("AC_ANIM_LOG").is_some() {
             let layers: Vec<String> = items.iter().map(|i| i.layers.iter().map(|(n, w)| format!("{n}*{w:.2}")).collect::<Vec<_>>().join("+")).collect();
-            info!("anim t={:.2} {:?} -> {} [{}] blend {} {:.2}s", time.elapsed_secs(), loco.current, req.key, layers.join(" | "), p.blend.kind, if p.prev.is_some() { p.fade_time } else { 0.0 });
+            info!("anim t={:.2} {:?} -> {} [{}] blend {} {:.2}s", time.elapsed_secs(), loco.current, req.key, layers.join(" | "), p.blend.kind, if p.outgoing.is_some() { p.fade_time } else { 0.0 });
         }
         p.clip = Some(req.key);
         p.items = items;
@@ -993,17 +1125,12 @@ fn choose_clip(
 /// what is left of A with the clamp flag.
 fn start_blend(p: &mut AnimPlayer, b: ActBlend, had: bool, a_state: Option<(Vec<ItemPlay>, usize, f32, bool)>, lib: &AnimLibrary) {
     p.blend = b;
-    p.a_roll = None;
     if b.kind == 0 || b.time <= 0.0 || !had {
-        p.prev = None;
+        p.outgoing = None;
         p.fade = 1.0;
         p.fade_time = 0.01;
         return;
     }
-    p.prev = Some(p.last_pose.clone());
-    p.prev_root = p.last_root;
-    p.prev_contacts = p.contacts;
-    p.fade = 0.0;
     let mut time = b.time;
     if let Some((items, item, phase, _)) = a_state.as_ref() {
         if b.clamp {
@@ -1013,15 +1140,16 @@ fn start_blend(p: &mut AnimPlayer, b: ActBlend, had: bool, a_state: Option<(Vec<
         }
     }
     p.fade_time = time.max(0.01);
-    if matches!(b.kind, 1 | 3) {
-        p.a_roll = a_state.filter(|(items, _, _, _)| !items.is_empty());
-    }
+    // A keeps playing only for the AROLLB* types (AROLLBROLL / AROLLBSTOP); otherwise it is frozen.
+    let roll = if matches!(b.kind, 1 | 3) { a_state } else { None };
+    p.outgoing = Some(OutgoingA::capture(p.last_pose.clone(), p.last_root, p.contacts, roll));
+    p.fade = 0.0;
 }
 
 /// B's start phase (`ACTBlendBPosMode`, 0x773F90): FROMSTART 0, PROGRESSIVE A's phase, INVPROGRESSIVE 1 − A's
 /// phase, FROMTARGETTIME the blend's target time.
 fn b_start_phase(p: &AnimPlayer, lib: &AnimLibrary, items: &[ItemPlay]) -> f32 {
-    let a_phase = p.a_roll.as_ref().map(|a| a.2).unwrap_or(p.phase);
+    let a_phase = p.outgoing.as_ref().and_then(|o| o.roll.as_ref()).map(|r| r.phase).unwrap_or(p.phase);
     match p.blend.b_pos {
         1 => a_phase,
         2 => 1.0 - a_phase,
@@ -1129,11 +1257,9 @@ pub fn apply_clip(
         } else {
             p.phase = next.min(1.0);
         }
-        // A keeps playing for the AROLLB* types
-        if let Some((items, ai, aph, alooping)) = p.a_roll.as_mut() {
-            let ad = items.get(*ai).map(|it| lib.item_duration(it)).unwrap_or(1.0).max(1e-3);
-            let n = *aph + dt / ad;
-            *aph = if *alooping { n.fract() } else { n.min(1.0) };
+        // A keeps playing for the AROLLB* types (its own clock; pose and root share this phase)
+        if let Some(o) = p.outgoing.as_mut() {
+            o.advance(&lib, dt);
         }
         p.fade = (p.fade + dt / p.fade_time.max(0.01)).min(1.0);
         let weight = blend_weight(&p.blend, p.fade);
@@ -1156,63 +1282,31 @@ pub fn apply_clip(
             p.event_cursor = Some((c.name.clone(), t));
         }
 
-        let fading = p.fade < 1.0 && p.prev.is_some();
+        let fading = p.fade < 1.0 && p.outgoing.is_some();
+        // ACTBlendAcuatorMode FROMA keeps A's contact tags while blending
         if fading && p.blend.acuator == 0 {
-            p.contacts = match p.a_roll.as_ref() {
-                Some((items, ai, aph, _)) => items.get(*ai).and_then(|it| lib.dominant(it)).map(|c| contact_state(c, *aph * c.duration)).unwrap_or(p.prev_contacts),
-                None => p.prev_contacts,
-            };
-        }
-        // a rolling A is sampled again this frame
-        if fading {
-            if let Some((items, ai, aph, _)) = p.a_roll.as_ref() {
-                if let Some(it) = items.get(*ai) {
-                    let mut a_pose = Vec::new();
-                    sample_layers(&lib, rig, &it.layers, *aph, &mut a_pose);
-                    p.prev = Some(a_pose);
-                }
-            }
+            p.contacts = p.outgoing.as_ref().map(|o| o.contacts(&lib)).unwrap_or(p.contacts);
         }
         if let Ok(mut root) = joints.get_mut(rig.root) {
             *root = anim_root();
-            if !p.looping && item.root_motion {
-                let mut off = Vec3::ZERO;
-                let mut wsum = 0.0;
-                for (n, w) in &item.layers {
-                    if let Some(c) = lib.clips.get(n) {
-                        off += root_motion_offset(c, p.phase) * *w;
-                        wsum += *w;
-                    }
-                }
-                if wsum > 0.0 {
-                    root.translation = root.rotation * (off / wsum);
-                }
-            }
+            // B's root motion (ACTDisplacementMode::FromAnim on a one-shot)
+            root.translation = item_root_translation(&lib, &item, p.phase, p.looping);
             if fading {
-                // ACTBlendDispSrcMode: BLENDAB, FROMAONLY, FROMBONLY
-                root.translation = match p.blend.disp_src {
-                    1 => p.prev_root,
-                    2 => root.translation,
-                    _ => p.prev_root.lerp(root.translation, weight),
-                };
+                // ACTBlendDispSrcMode: BLENDAB, FROMAONLY, FROMBONLY. A's root comes from the same
+                // evaluatable outgoing state as A's pose, so it advances instead of staying frozen.
+                let a_root = p.outgoing.as_mut().map(|o| o.root(&lib)).unwrap_or(Vec3::ZERO);
+                root.translation = blend_root(a_root, root.translation, p.blend.disp_src, weight);
             }
             p.last_root = root.translation;
         }
         sample_layers(&lib, rig, &item.layers, p.phase, &mut cur);
-        let prev = if fading { p.prev.take() } else { None };
-        let empty = Vec::new();
-        let prev_pose = prev.as_ref().filter(|v| v.len() == cur.len()).unwrap_or(&empty);
+        let prev_pose = if fading { p.outgoing.as_mut().map(|o| o.pose(&lib, rig)) } else { None };
         let mut shown = std::mem::take(&mut p.last_pose);
         shown.clear();
-        let mut base: Vec<(Quat, Vec3)> = (0..rig.joints.len())
-            .map(|i| {
-                let (rot, pos) = cur[i];
-                match prev_pose.get(i) {
-                    Some(&(r0, p0)) => (qinterp(r0, rot, weight), p0.lerp(pos, weight)),
-                    None => (rot, pos),
-                }
-            })
-            .collect();
+        let mut base: Vec<(Quat, Vec3)> = match prev_pose.as_ref() {
+            Some(prev) => blend_full_pose(prev, &cur, weight),
+            None => cur.clone(),
+        };
         if let Some(o) = p.overlay.as_mut() {
             apply_overlay(o, &lib, rig, &mut base, dt);
         }
@@ -1230,7 +1324,9 @@ pub fn apply_clip(
             tr.translation = pos;
         }
         p.last_pose = shown;
-        p.prev = if p.fade >= 1.0 { None } else { prev };
+        if p.fade >= 1.0 {
+            p.outgoing = None;
+        }
     }
 }
 
@@ -1270,6 +1366,136 @@ fn load_library(mut lib: ResMut<AnimLibrary>) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ---------------------------------------------------------------- AC1-REV-012 fixtures
+    //
+    // A one-bone rig plus synthetic A/B/C clips are enough to reproduce the two defects the review
+    // found: (1) an interrupted A→B blend discarded the composite on screen for a pure re-sample of the
+    // rolling item, and (2) a rolling A advanced its pose while its root stayed frozen.
+
+    const TEST_BONE: u32 = 0xABCD_1234;
+
+    fn one_bone_rig() -> Rig {
+        Rig {
+            root: Entity::PLACEHOLDER,
+            joints: vec![Entity::PLACEHOLDER],
+            rest: vec![Transform::from_rotation(Quat::IDENTITY)],
+            bone_ids: vec![TEST_BONE],
+            parents: vec![None],
+        }
+    }
+
+    /// A one-bone clip rotating from `0` to `angle` rad over 1 s.
+    fn rot_clip(name: &str, angle: f32) -> AnimClip {
+        AnimClip { name: name.into(), duration: 1.0, rotations: [(TEST_BONE, vec![(0.0, Quat::IDENTITY), (1.0, Quat::from_rotation_x(angle))])].into_iter().collect(), ..default() }
+    }
+
+    /// A one-bone non-rotating clip holding `angle`, so the item contributes no per-frame motion.
+    fn static_clip(name: &str, angle: f32) -> AnimClip {
+        AnimClip { name: name.into(), duration: 1.0, rotations: [(TEST_BONE, vec![(0.0, Quat::from_rotation_x(angle))])].into_iter().collect(), ..default() }
+    }
+
+    /// A one-bone clip rotating like `rot_clip` and carrying a nonlinear DISPLACEMENT (root-motion) track.
+    fn root_clip(name: &str, angle: f32, disp: Vec3) -> AnimClip {
+        AnimClip {
+            name: name.into(),
+            duration: 1.0,
+            rotations: [(TEST_BONE, vec![(0.0, Quat::IDENTITY), (1.0, Quat::from_rotation_x(angle))])].into_iter().collect(),
+            translations: [
+                (TEST_BONE, vec![(0.0, Vec3::ZERO), (1.0, Vec3::ZERO)]),
+                (crate::assets::ac_anim::TRACK_DISPLACEMENT, vec![(0.0, Vec3::ZERO), (0.5, disp * 0.1), (1.0, disp)]),
+            ]
+            .into_iter()
+            .collect(),
+            ..default()
+        }
+    }
+
+    fn lib_with(clips: Vec<AnimClip>) -> AnimLibrary {
+        AnimLibrary { clips: clips.into_iter().map(|c| (c.name.clone(), c)).collect(), ..default() }
+    }
+
+    fn test_item(name: &str, root_motion: bool) -> ItemPlay {
+        ItemPlay { layers: vec![(name.into(), 1.0)], blend: ActBlend::DEFAULT, root_motion, action: 0, transitions: Vec::new() }
+    }
+
+    fn sample(lib: &AnimLibrary, rig: &Rig, it: &ItemPlay, phase: f32) -> Vec<(Quat, Vec3)> {
+        let mut out = Vec::new();
+        sample_layers(lib, rig, &it.layers, phase, &mut out);
+        out
+    }
+
+    fn angle_between(a: &[(Quat, Vec3)], b: &[(Quat, Vec3)]) -> f32 {
+        a.iter().zip(b).map(|(x, y)| x.0.angle_between(y.0)).fold(0.0, f32::max)
+    }
+
+    #[test]
+    fn interrupted_rollblend_keeps_the_composite_pose() {
+        // A rotates, B is a static pose: after a 50% A→B blend the two differ, so discarding the
+        // composite for a pure B re-sample (the old defect) is a visible one-frame jump.
+        let rig = one_bone_rig();
+        let lib = lib_with(vec![rot_clip("A", 1.0), static_clip("B", 0.3), static_clip("C", -0.4)]);
+        let item_a = test_item("A", false);
+        let item_b = test_item("B", false);
+        let item_c = test_item("C", false);
+        let blend = |kind, time| ActBlend { kind, time, ..ActBlend::DEFAULT };
+
+        // A→B has been fading for 50%: A's clock and the blend progress are both 0.5.
+        let a_phase = 0.5;
+        let b_phase = 0.5;
+        let w1 = blend_weight(&blend(1, 0.2), 0.5);
+        let mut outgoing1 = OutgoingA::capture(sample(&lib, &rig, &item_a, 0.0), Vec3::ZERO, default(), Some((vec![item_a.clone()], 0, 0.0, false)));
+        outgoing1.advance(&lib, a_phase); // roll A to 0.5
+        let b_pose = sample(&lib, &rig, &item_b, b_phase);
+        let shown1 = blend_full_pose(&outgoing1.pose(&lib, &rig), &b_pose, w1);
+        let root1 = blend_root(outgoing1.root(&lib), Vec3::ZERO, 0, w1);
+
+        // A B→C AROLLBROLL transition interrupts the fade: B is the new rolling outgoing item.
+        let mut outgoing2 = OutgoingA::capture(shown1.clone(), root1, default(), Some((vec![item_b.clone()], 0, b_phase, false)));
+        outgoing2.advance(&lib, 1.0 / 60.0);
+        let w2 = blend_weight(&blend(1, 0.2), 0.0); // C's blend starts at fade 0
+        let shown2 = blend_full_pose(&outgoing2.pose(&lib, &rig), &sample(&lib, &rig, &item_c, 0.0), w2);
+
+        // No one-frame discontinuity: the captured composite is advanced, not discarded.
+        assert!(angle_between(&shown1, &shown2) < 1e-4, "composite pose jumped on interruption: {:.4} rad", angle_between(&shown1, &shown2));
+        // ... and the fixture really would jump if the composite were replaced by pure B.
+        assert!(angle_between(&shown1, &b_pose) > 0.05, "fixture too weak: composite and B coincide");
+    }
+
+    #[test]
+    fn rolling_a_advances_pose_and_root_from_the_same_state() {
+        let rig = one_bone_rig();
+        let lib = lib_with(vec![root_clip("roll", 1.0, Vec3::new(0.0, 0.0, 2.0))]);
+        let item = test_item("roll", true);
+        let mut outgoing = OutgoingA::capture(sample(&lib, &rig, &item, 0.0), Vec3::ZERO, default(), Some((vec![item.clone()], 0, 0.0, false)));
+
+        outgoing.advance(&lib, 0.25);
+        let pose1 = outgoing.pose(&lib, &rig);
+        let root1 = outgoing.root(&lib);
+        outgoing.advance(&lib, 0.25);
+        let pose2 = outgoing.pose(&lib, &rig);
+        let root2 = outgoing.root(&lib);
+
+        // The pose advanced...
+        assert!(angle_between(&pose1, &pose2) > 0.1, "rolling A pose did not advance");
+        // ... and the root advanced with it, instead of staying frozen.
+        assert!((root2 - root1).length() > 1e-3, "rolling A root stayed frozen");
+        // The root delta is exactly the clip's root motion over the same phase interval.
+        let expected = item_root_translation(&lib, &item, 0.5, false) - item_root_translation(&lib, &item, 0.25, false);
+        assert!((root2 - root1 - expected).length() < 1e-5, "root delta {} != clip motion {}", (root2 - root1).length(), expected.length());
+    }
+
+    #[test]
+    fn frozen_outgoing_state_does_not_move() {
+        let rig = one_bone_rig();
+        let lib = lib_with(vec![rot_clip("A", 1.0)]);
+        let mut outgoing = OutgoingA::capture(sample(&lib, &rig, &test_item("A", false), 0.5), Vec3::new(0.1, 0.2, 0.3), default(), None);
+        let pose0 = outgoing.pose(&lib, &rig);
+        let root0 = outgoing.root(&lib);
+        outgoing.advance(&lib, 0.25);
+        assert_eq!(outgoing.pose(&lib, &rig), pose0, "frozen A pose must not advance");
+        assert_eq!(outgoing.root(&lib), root0, "frozen A root must not move");
+    }
 
     #[test]
     fn blend_weights_follow_the_ease_flags() {
